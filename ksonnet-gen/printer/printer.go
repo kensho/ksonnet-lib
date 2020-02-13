@@ -7,8 +7,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/go-jsonnet/ast"
+	"github.com/google/go-jsonnet/parser"
 	"github.com/ksonnet/ksonnet-lib/ksonnet-gen/astext"
 	"github.com/pkg/errors"
 )
@@ -24,6 +26,16 @@ const (
 	syntaxSugar = '+'
 )
 
+// quoteMode is an enumeration specifying how a jsonnet string should be quoted.
+type quoteMode int
+
+const (
+	quoteModeNone quoteMode = iota
+	quoteModeSingle
+	quoteModeDouble
+	quoteModeBlock
+)
+
 // Fprint prints a node to the supplied writer using the default
 // configuration.
 func Fprint(output io.Writer, node ast.Node) error {
@@ -32,7 +44,10 @@ func Fprint(output io.Writer, node ast.Node) error {
 
 // DefaultConfig is a default configuration.
 var DefaultConfig = Config{
-	IndentSize: 2,
+	IndentSize:  2,
+	PadArrays:   false,
+	PadObjects:  true,
+	SortImports: true,
 }
 
 // IndentMode is the indent mode for Config.
@@ -47,8 +62,11 @@ const (
 
 // Config is a configuration for the printer.
 type Config struct {
-	IndentSize int
-	IndentMode IndentMode
+	IndentSize  int
+	IndentMode  IndentMode
+	PadArrays   bool
+	PadObjects  bool
+	SortImports bool
 }
 
 // Fprint prints a node to the supplied writer.
@@ -120,6 +138,130 @@ func (p *printer) writeStringNoIndent(s string) {
 	}
 }
 
+// detectQuoteMode decides what quote style to use for serializing
+// a jsonnet string, with logic similar to that of `jsonnet fmt`.
+//
+// Briefly, single quotes are preferred, unless escaping can be avoided
+// by using double quotes.
+// In cases where both single and double quotes are detected,
+// the status-quo is preferred (as specificed by `kind`).
+func detectQuoteMode(s string, kind ast.LiteralStringKind) quoteMode {
+	hasSingle := strings.ContainsRune(s, '\'')
+	hasDouble := strings.ContainsRune(s, '"')
+
+	switch kind {
+	default:
+		return quoteModeNone
+	case ast.StringSingle:
+		// Go with single unless there's only single quotes already.
+		useSingle := !(hasSingle && !hasDouble)
+		if useSingle {
+			return quoteModeSingle
+		}
+
+	case ast.StringDouble:
+		// Cases:
+		// 1. [" 'abc' "] -> [" 'abc' "]
+		// 2. [" \"abc\" "] -> [' "abc" ']
+		// 3. [" 'abc' \"123\" "] -> [" 'abc' \"123\" "]
+		// 4. [" abc "] -> [' abc ']
+		useDouble := (hasSingle && !hasDouble) ||
+			(hasSingle && hasDouble)
+		if useDouble {
+			return quoteModeDouble
+		}
+	case ast.StringBlock:
+		return quoteModeBlock
+	}
+
+	return quoteModeNone
+}
+
+func unquote(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+
+	sb := strings.Builder{}
+	sb.Grow(len(s))
+
+	tail := s
+	for len(tail) > 0 {
+		c, width := utf8.DecodeRuneInString(tail)
+
+		switch c {
+		case utf8.RuneError:
+			tail = tail[width:]
+			continue // Skip this character
+		case '"':
+			// strconv.UnquoteChar won't allow a bare quote in double-quote mode, but we will
+			sb.WriteRune(c)
+			tail = tail[width:]
+		default:
+			c, _, t2, err := strconv.UnquoteChar(tail, byte('"'))
+			if err != nil {
+				// Skip character. Ensure we move forward.
+				tail = tail[width:]
+				continue
+			}
+			tail = t2
+			sb.WriteRune(c)
+		}
+	}
+
+	return sb.String()
+}
+
+// quote returns a single or double quoted string, escaped for jsonnet.
+// This function does *not* protect against double-escaping. Instead use `stringQuote`.
+func quote(s string, useSingle bool) string {
+	var quote rune
+	if useSingle {
+		quote = '\''
+	} else {
+		quote = '"'
+	}
+
+	sb := strings.Builder{}
+	sb.Grow(len(s) + 2)
+
+	sb.WriteRune(quote)
+
+	for _, c := range s {
+		switch c {
+		case '\'':
+			if useSingle {
+				sb.WriteString("\\'")
+			} else {
+				sb.WriteRune(c)
+			}
+		case '"':
+			if !useSingle {
+				sb.WriteString("\\\"")
+			} else {
+				sb.WriteRune(c)
+			}
+		default:
+			q := strconv.QuoteRune(c) // This is returned with unneeded quotes
+			sb.WriteString(q[1 : len(q)-1])
+		}
+	}
+
+	sb.WriteRune(quote)
+	return sb.String()
+}
+
+// stringQuote returns a quoted jsonnet string ready for serialization.
+// Appropriate measures are taken to avoid double-escaping any control characters.
+// `useSingle` specifies whether to use single quotes, otherwise double-quotes are used.
+// Note the following characters will be escaped (with leading backslash): "'\/bfnrt
+// Quotes (single or double) will only be escaped to avoid conflict with the enclosing quote type.
+func stringQuote(s string, useSingle bool) string {
+	unquoted := unquote(s) // Avoid double-escaping control characters
+
+	return quote(unquoted, useSingle)
+}
+
 // printer prints a node.
 // nolint: gocyclo
 func (p *printer) print(n interface{}) {
@@ -148,11 +290,15 @@ func (p *printer) print(n interface{}) {
 		if loc := t.NodeBase.Loc(); loc != nil && loc.Begin.Line == loc.End.Line {
 			oneLine = true
 		}
+		shouldPad := oneLine && p.cfg.PadArrays && len(t.Elements) > 0
 
 		p.writeString("[")
 		if !oneLine {
 			p.indentLevel++
 			p.writeByte(newline, 1)
+		}
+		if shouldPad {
+			p.writeByte(space, 1)
 		}
 
 		for i := 0; i < len(t.Elements); i++ {
@@ -168,9 +314,17 @@ func (p *printer) print(n interface{}) {
 			}
 		}
 
+		// Trailing comma
+		if !oneLine && len(t.Elements) > 0 {
+			p.writeByte(comma, 1)
+		}
+
 		if !oneLine {
 			p.indentLevel--
 			p.writeByte(newline, 1)
+		}
+		if shouldPad {
+			p.writeByte(space, 1)
 		}
 
 		p.writeString("]")
@@ -237,37 +391,13 @@ func (p *printer) print(n interface{}) {
 	case *ast.Local:
 		p.handleLocal(t)
 	case *ast.Object:
+		isSingleLine := p.isObjectSingleLine(t)
+		shouldPad := isSingleLine && p.cfg.PadObjects && len(t.Fields) > 0
+		needTrailingComma := !isSingleLine && len(t.Fields) > 0
 		p.writeString("{")
-
-		for i, field := range t.Fields {
-			if !p.isObjectSingleLine(t) {
-				p.indentLevel++
-				p.writeByte(newline, 1)
-			}
-
-			p.print(field)
-			if p.isObjectSingleLine(t) {
-				if i < len(t.Fields)-1 {
-					p.writeByte(comma, 1)
-					p.writeByte(space, 1)
-				}
-			} else {
-				p.writeByte(comma, 1)
-			}
-
-			if !p.isObjectSingleLine(t) {
-				p.indentLevel--
-			}
+		if shouldPad {
+			p.writeByte(space, 1)
 		}
-
-		// write an extra newline at the end
-		if !p.isObjectSingleLine(t) {
-			p.writeByte(newline, 1)
-		}
-
-		p.writeString("}")
-	case *astext.Object:
-		p.writeString("{")
 
 		for i, field := range t.Fields {
 			if !p.isObjectSingleLine(t) {
@@ -288,11 +418,59 @@ func (p *printer) print(n interface{}) {
 			}
 		}
 
+		if needTrailingComma {
+			p.writeByte(comma, 1)
+		}
+
 		// write an extra newline at the end
 		if !p.isObjectSingleLine(t) {
 			p.writeByte(newline, 1)
 		}
 
+		if shouldPad {
+			p.writeByte(space, 1)
+		}
+		p.writeString("}")
+	case *astext.Object:
+		isSingleLine := p.isObjectSingleLine(t)
+		shouldPad := isSingleLine && p.cfg.PadObjects && len(t.Fields) > 0
+		needTrailingComma := !isSingleLine && len(t.Fields) > 0
+		p.writeString("{")
+		if shouldPad {
+			p.writeByte(space, 1)
+		}
+
+		for i, field := range t.Fields {
+			if !p.isObjectSingleLine(t) {
+				p.indentLevel++
+				p.writeByte(newline, 1)
+			}
+
+			p.print(field)
+			if i < len(t.Fields)-1 {
+				p.writeByte(comma, 1)
+				if p.isObjectSingleLine(t) {
+					p.writeByte(space, 1)
+				}
+			}
+
+			if !p.isObjectSingleLine(t) {
+				p.indentLevel--
+			}
+		}
+
+		if needTrailingComma {
+			p.writeByte(comma, 1)
+		}
+
+		// write an extra newline at the end
+		if !p.isObjectSingleLine(t) {
+			p.writeByte(newline, 1)
+		}
+
+		if shouldPad {
+			p.writeByte(space, 1)
+		}
 		p.writeString("}")
 	case *ast.ObjectComp:
 		p.handleObjectComp(t)
@@ -305,14 +483,22 @@ func (p *printer) print(n interface{}) {
 			p.writeString("false")
 		}
 	case *ast.LiteralString:
+		qm := detectQuoteMode(t.Value, t.Kind)
+
 		switch t.Kind {
 		default:
 			p.err = errors.Errorf("unknown string literal kind %#v", t.Kind)
 			return
-		case ast.StringSingle:
-			p.writeString(fmt.Sprintf("'%s'", t.Value))
-		case ast.StringDouble:
-			p.writeString(strconv.Quote(t.Value))
+		case ast.StringSingle, ast.StringDouble:
+			useSingle := (qm != quoteModeDouble)
+
+			// Unescape newlines and tabs. The jsonnet parser will escape
+			// these during parsing.
+			val := strings.Replace(t.Value, "\\n", "\n", -1)
+			val = strings.Replace(val, "\\t", "\t", -1)
+
+			quoted := stringQuote(val, useSingle)
+			p.writeString(quoted)
 		case ast.StringBlock:
 			p.writeString("|||")
 			p.writeByte(newline, 1)
@@ -331,6 +517,7 @@ func (p *printer) print(n interface{}) {
 		}
 
 	case *ast.LiteralNumber:
+
 		p.writeString(t.OriginalString)
 	case *ast.Parens:
 		p.writeString("(")
@@ -515,35 +702,95 @@ func (p *printer) handleLocalFunction(f *ast.Function) {
 	}
 }
 
-func fieldID(kind ast.ObjectFieldKind, expr1 ast.Node, id *ast.Identifier) string {
+// shouldUnquoteFieldID determines whether s can be an unquoted field identifier.
+// Things that can't be unquoted: keywords, expressions.
+func shouldUnquoteFieldID(s string) bool {
+	// Try to pose the string as a raw (unquoted) object field identifier.
+	// If this succeeds, quotes are not needed.
+	toParse := fmt.Sprintf("{%s: 'value'}", s)
+	tokens, err := parser.Lex("", toParse)
+	if err != nil {
+		return false
+	}
+
+	if len(tokens) < 3 {
+		return false
+	}
+
+	// The following pattern would show s tokenized entirely as a single identifier.
+	// NOTE we resort to string matching as `token.kind` is not exported.
+	idTokenMatch := fmt.Sprintf("(IDENTIFIER, \"%s\")", s)
+
+	if tokens[1].String() == idTokenMatch &&
+		tokens[2].String() == "\":\"" {
+		return true
+	}
+
+	return false
+}
+
+// reID matches `id` as defined in the jsonnet spec
+var reID = regexp.MustCompile(`^[_a-zA-Z][_a-zA-Z0-9]*$`)
+
+func (p *printer) fieldID(kind ast.ObjectFieldKind, expr1 ast.Node, id *ast.Identifier) {
 	if expr1 != nil {
 		switch t := expr1.(type) {
-		case *ast.LiteralString:
-			var qt string
-			if t.Kind == ast.StringDouble {
-				qt = `"`
-			} else if t.Kind == ast.StringSingle {
-				qt = `'`
-			} else {
-				panic(`only able to handle to handle single and double quoted strings`)
-			}
-			return fmt.Sprintf(`%s%s%s`, qt, t.Value, qt)
-		case *ast.Var:
-			return string(t.Id)
 		default:
-			panic(fmt.Sprintf("unknown Expr1 type %T", t))
+			p.print(t)
+			return
+		case *ast.LiteralString:
+			qm := detectQuoteMode(t.Value, t.Kind)
+			useSingle := (qm == quoteModeSingle)
+			quoted := stringQuote(t.Value, useSingle)
+
+			// Block quotes (|||) are always retained:
+			if qm == quoteModeBlock {
+				sb := strings.Builder{}
+				sb.WriteString("|||")
+				sb.WriteByte(newline)
+				// Indent the value using BlockIndent, but be aware that our caller
+				// will also be indenting using indentLevel. Remove those many bytes.
+				padding := strings.Repeat(" ", p.indentLevel*p.cfg.IndentSize)
+				replaceCount := strings.Count(t.Value, "\n") - 1 // Replace all but the last newline
+				indented := padding + strings.Replace(t.Value, "\n", ("\n"+padding), replaceCount)
+				sb.WriteString(indented)
+				sb.WriteString("|||")
+				p.writeString(sb.String())
+				return
+			}
+
+			// Return identity if quotes aren't strictly necessary,
+			// that is it could pass for a bare identifier without ambiguity.
+			// This is not the case for keywords, expressions,
+			// e.g. 'guestbook-ui' or 'error'.
+			switch kind {
+			case ast.ObjectFieldID, ast.ObjectFieldStr:
+				if shouldUnquoteFieldID(t.Value) {
+					p.writeString(t.Value)
+					return
+				}
+			}
+
+			// Example where quotes are needed: kind==ObjectFieldExpr
+			p.writeString(quoted)
+			return
 		}
 	}
 
 	if id != nil {
-		return string(*id)
+		p.writeString(string(*id))
+		return
 	}
-
-	return ""
 }
 
 func (p *printer) handleObjectComp(oc *ast.ObjectComp) {
+	p.writeString("{")
+	p.indentLevel++
+	p.writeByte(newline, 1)
 	p.handleObjectField(oc)
+	p.indentLevel--
+	p.writeByte(newline, 1)
+	p.writeString("}")
 }
 
 func (p *printer) handleArrayComp(ac *ast.ArrayComp) {
@@ -564,21 +811,24 @@ func (p *printer) forSpec(spec ast.ForSpec) {
 		p.writeByte(newline, 1)
 	}
 
-	p.writeString(fmt.Sprintf("for %s in ", string(spec.VarName)))
-	p.print(spec.Expr)
+	if spec.VarName != "" {
+		p.writeString(fmt.Sprintf("for %s in ", string(spec.VarName)))
+		p.print(spec.Expr)
 
-	for _, ifSpec := range spec.Conditions {
-		p.writeByte(space, 1)
-		p.print(ifSpec)
+		for _, ifSpec := range spec.Conditions {
+			p.writeByte(newline, 1)
+			p.print(ifSpec)
+		}
 	}
 }
 
 func (p *printer) handleObjectField(n interface{}) {
 	var ofHide ast.ObjectFieldHide
 	var ofKind ast.ObjectFieldKind
-	var ofID string
+	var ofID *ast.Identifier
 	var ofMethod *ast.Function
 	var ofSugar bool
+	var ofExpr1 ast.Node
 	var ofExpr2 ast.Node
 	var ofExpr3 ast.Node
 
@@ -591,17 +841,19 @@ func (p *printer) handleObjectField(n interface{}) {
 	case ast.ObjectField:
 		ofHide = t.Hide
 		ofKind = t.Kind
-		ofID = fieldID(ofKind, t.Expr1, t.Id)
+		ofID = t.Id
 		ofMethod = t.Method
 		ofSugar = t.SuperSugar
+		ofExpr1 = t.Expr1
 		ofExpr2 = t.Expr2
 		ofExpr3 = t.Expr3
 	case astext.ObjectField:
 		ofHide = t.Hide
 		ofKind = t.Kind
-		ofID = fieldID(ofKind, t.Expr1, t.Id)
+		ofID = t.Id
 		ofMethod = t.Method
 		ofSugar = t.SuperSugar
+		ofExpr1 = t.Expr1
 		ofExpr2 = t.Expr2
 		ofExpr3 = t.Expr3
 		p.writeComment(t.Comment)
@@ -609,8 +861,8 @@ func (p *printer) handleObjectField(n interface{}) {
 		field := t.Fields[0]
 		ofHide = field.Hide
 		ofKind = field.Kind
-		ofID = fieldID(ofKind, field.Expr1, field.Id)
 		ofMethod = field.Method
+		ofExpr1 = field.Expr1
 		ofSugar = field.SuperSugar
 		ofExpr2 = field.Expr2
 
@@ -643,7 +895,7 @@ func (p *printer) handleObjectField(n interface{}) {
 			p.print(ofExpr3)
 		}
 	case ast.ObjectFieldID:
-		p.writeString(ofID)
+		p.fieldID(ofKind, ofExpr1, ofID)
 		if ofMethod != nil {
 			p.addMethodSignature(ofMethod)
 		}
@@ -667,12 +919,12 @@ func (p *printer) handleObjectField(n interface{}) {
 
 	case ast.ObjectLocal:
 		p.writeString("local ")
-		p.writeString(ofID)
+		p.fieldID(ofKind, ofExpr1, ofID)
 		p.addMethodSignature(ofMethod)
 		p.writeString(" = ")
 		p.print(ofExpr2)
 	case ast.ObjectFieldStr:
-		p.writeString(ofID)
+		p.fieldID(ofKind, ofExpr1, ofID)
 		if ofSugar {
 			p.writeByte(syntaxSugar, 1)
 		}
@@ -680,16 +932,14 @@ func (p *printer) handleObjectField(n interface{}) {
 		p.writeByte(space, 1)
 		p.print(ofExpr2)
 	case ast.ObjectFieldExpr:
-		p.writeString("{")
-		p.indentLevel++
-		p.writeByte(newline, 1)
-		p.writeString(fmt.Sprintf("[%s]: ", ofID))
+		p.writeString("[")
+		p.fieldID(ofKind, ofExpr1, ofID)
+		p.writeString("]: ")
 		p.print(ofExpr2)
-		p.writeByte(space, 1)
-		p.forSpec(forSpec)
-		p.indentLevel--
-		p.writeByte(newline, 1)
-		p.writeString("}")
+		if forSpec.VarName != "" {
+			p.writeByte(newline, 1)
+			p.forSpec(forSpec)
+		}
 	}
 }
 
@@ -765,7 +1015,8 @@ func (p *printer) indexID(i *ast.Index) {
 				p.writeString(fmt.Sprintf(".%s", id))
 				return
 			}
-			p.writeString(fmt.Sprintf(`["%s"]`, id))
+			quoted := stringQuote(id, true)
+			p.writeString(fmt.Sprintf(`[%s]`, quoted))
 		case *ast.Unary:
 			p.writeString("[")
 			p.print(t)
@@ -775,7 +1026,8 @@ func (p *printer) indexID(i *ast.Index) {
 		}
 	} else if i.Id != nil {
 		id := string(*i.Id)
-		index := fmt.Sprintf(`["%s"]`, id)
+		quoted := stringQuote(id, true)
+		index := fmt.Sprintf(`[%s]`, quoted)
 		if reDotIndex.MatchString(id) {
 			index = fmt.Sprintf(`.%s`, id)
 		}

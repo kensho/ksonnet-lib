@@ -9,6 +9,8 @@ import (
 
 func TestCreateField(t *testing.T) {
 	id := ast.Identifier("name")
+	uID := ast.Identifier("underscore_name")
+	leadingID := ast.Identifier("__leading")
 
 	cases := []struct {
 		name     string
@@ -22,12 +24,66 @@ func TestCreateField(t *testing.T) {
 					Kind: ast.ObjectFieldID, Id: &id}},
 		},
 		{
+			name: "underscore_name",
+			expected: &ObjectField{
+				ObjectField: ast.ObjectField{
+					Kind: ast.ObjectFieldID, Id: &uID}},
+		},
+		{
+			name: "underscore_field-",
+			expected: &ObjectField{
+				ObjectField: ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Expr1: &ast.LiteralString{
+						Value: "underscore_field-",
+						Kind:  ast.StringDouble,
+					}}},
+		},
+		{
 			name: "dashed-name",
 			expected: &ObjectField{
 				ObjectField: ast.ObjectField{
 					Kind: ast.ObjectFieldStr,
 					Expr1: &ast.LiteralString{
 						Value: "dashed-name",
+						Kind:  ast.StringDouble,
+					}}},
+		},
+		{
+			name: "__leading",
+			expected: &ObjectField{
+				ObjectField: ast.ObjectField{
+					Kind: ast.ObjectFieldID,
+					Id:   &leadingID,
+				}},
+		},
+		{
+			name: "dot.name",
+			expected: &ObjectField{
+				ObjectField: ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Expr1: &ast.LiteralString{
+						Value: "dot.name",
+						Kind:  ast.StringDouble,
+					}}},
+		},
+		{
+			name: ".",
+			expected: &ObjectField{
+				ObjectField: ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Expr1: &ast.LiteralString{
+						Value: ".",
+						Kind:  ast.StringDouble,
+					}}},
+		},
+		{
+			name: "9p",
+			expected: &ObjectField{
+				ObjectField: ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Expr1: &ast.LiteralString{
+						Value: "9p",
 						Kind:  ast.StringDouble,
 					}}},
 		},

@@ -12,6 +12,7 @@ import (
 	"github.com/google/go-jsonnet/ast"
 	"github.com/google/go-jsonnet/parser"
 	"github.com/ksonnet/ksonnet-lib/ksonnet-gen/astext"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,6 +35,7 @@ func TestFprintf(t *testing.T) {
 		{name: "literal_with_newline"},
 		{name: "literal_with_single_quote"},
 		{name: "object_field_with_comment"},
+		{name: "object_field_trailing_comma"},
 		{name: "function_with_no_args"},
 		{name: "function_with_args"},
 		{name: "function_with_optional_args_ast"},
@@ -64,6 +66,8 @@ func TestFprintf(t *testing.T) {
 		{name: "block_string"},
 		{name: "dollar"},
 		{name: "nil_node"},
+		{name: "trimmed_whitespace_in_tests"},
+		{name: "field_id_keywords"},
 
 		// errors
 		{name: "unknown_node", isErr: true},
@@ -98,9 +102,11 @@ func TestFprintf(t *testing.T) {
 			testData, err := ioutil.ReadFile(testDataFile)
 			require.NoError(t, err, "unable to read test data")
 
-			if got, expected := buf.String(), string(testData); got != expected {
+			got := strings.TrimSpace(buf.String())
+			expected := strings.TrimSpace(string(testData))
+			if got != expected {
 				t.Fatalf("Fprint\ngot      = %s\nexpected = %s",
-					strconv.Quote(got), strconv.Quote(expected))
+					got, expected)
 			}
 		})
 	}
@@ -144,8 +150,8 @@ func Test_with_upstream_golden(t *testing.T) {
 				// dmp := diffmatchpatch.New()
 				// diffs := dmp.DiffMain(expected, got, false)
 				// t.Fatalf(dmp.DiffPrettyText(diffs))
-				t.Fatalf("Fprint from upstream\ngot:\n %s\n===\nexpected:\n%s\n",
-					got, expected)
+				t.Fatalf("Fprint from upstream\ngot:\n%s\n===\nexpected:\n%s\n",
+					strconv.Quote(got), strconv.Quote(expected))
 			}
 		})
 	}
@@ -384,6 +390,26 @@ var (
 			},
 		},
 		"object_field_with_comment": &astext.Object{
+			Object: ast.Object{TrailingComma: false},
+			Fields: []astext.ObjectField{
+				{
+					ObjectField: ast.ObjectField{
+						Kind: ast.ObjectFieldID,
+						Hide: ast.ObjectFieldInherit,
+						Id:   &id1,
+						Expr2: &ast.LiteralString{
+							Value: "value",
+							Kind:  ast.StringDouble,
+						},
+					},
+					Comment: &astext.Comment{
+						Text: "a comment",
+					},
+				},
+			},
+		},
+		"object_field_trailing_comma": &astext.Object{
+			Object: ast.Object{TrailingComma: true},
 			Fields: []astext.ObjectField{
 				{
 					ObjectField: ast.ObjectField{
@@ -1015,6 +1041,73 @@ var (
 				},
 			},
 		},
+		"trimmed_whitespace_in_tests": &ast.Object{
+			Fields: ast.ObjectFields{},
+		},
+		"field_id_keywords": &ast.Object{
+			Fields: ast.ObjectFields{
+				ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Hide: ast.ObjectFieldInherit,
+					Expr1: &ast.LiteralString{
+						Value: "error",
+						Kind:  ast.StringSingle,
+					},
+					Expr2: &ast.LiteralString{
+						Value: "value",
+						Kind:  ast.StringSingle,
+					},
+				},
+				ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Hide: ast.ObjectFieldInherit,
+					Expr1: &ast.LiteralString{
+						Value: "local",
+						Kind:  ast.StringSingle,
+					},
+					Expr2: &ast.LiteralString{
+						Value: "value",
+						Kind:  ast.StringSingle,
+					},
+				},
+				ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Hide: ast.ObjectFieldInherit,
+					Expr1: &ast.LiteralString{
+						Value: "unquoteme",
+						Kind:  ast.StringSingle,
+					},
+					Expr2: &ast.LiteralString{
+						Value: "value",
+						Kind:  ast.StringSingle,
+					},
+				},
+				ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Hide: ast.ObjectFieldInherit,
+					Expr1: &ast.LiteralString{
+						Value: "but-not-me",
+						Kind:  ast.StringSingle,
+					},
+					Expr2: &ast.LiteralString{
+						Value: "value",
+						Kind:  ast.StringSingle,
+					},
+				},
+				ast.ObjectField{
+					Kind: ast.ObjectFieldStr,
+					Hide: ast.ObjectFieldInherit,
+					Expr1: &ast.LiteralString{
+						Value: "nor:me",
+						Kind:  ast.StringSingle,
+					},
+					Expr2: &ast.LiteralString{
+						Value: "value",
+						Kind:  ast.StringSingle,
+					},
+				},
+			},
+		},
 	}
 )
 
@@ -1111,6 +1204,50 @@ func Test_handleObjectField_unknown_object(t *testing.T) {
 	p := printer{cfg: DefaultConfig}
 	p.handleObjectField(nil)
 	require.Error(t, p.err)
+}
+
+func Test_quoteString(t *testing.T) {
+	tests := []struct {
+		s         string
+		expected  string
+		useSingle bool
+	}{
+		{
+			s:         "\\tFoo\tBar",
+			expected:  `'\tFoo\tBar'`,
+			useSingle: true,
+		},
+		{
+			s:         "\\tFoo\tBar",
+			expected:  `"\tFoo\tBar"`,
+			useSingle: false,
+		},
+		{
+			s:         "Foo\n\u000aBar",
+			expected:  `'Foo\n\nBar'`,
+			useSingle: true,
+		},
+		{
+			s:         "Foo\n\\u000a\rBar",
+			expected:  `'Foo\n\n\rBar'`,
+			useSingle: true,
+		},
+		{
+			s:         "'Foo'\\n\"Bar\\\"",
+			expected:  `'\'Foo\'\n"Bar"'`,
+			useSingle: true,
+		},
+		{
+			s:         "'Foo'\\n\"Bar\\\"",
+			expected:  `"'Foo'\n\"Bar\""`,
+			useSingle: false,
+		},
+	}
+
+	for _, tc := range tests {
+		actual := stringQuote(tc.s, tc.useSingle)
+		assert.Equal(t, tc.expected, actual)
+	}
 }
 
 func newLiteralNumber(in string) *ast.LiteralNumber {
